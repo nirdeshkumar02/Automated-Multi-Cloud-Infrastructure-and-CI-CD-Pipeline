@@ -1,0 +1,112 @@
+// Jenkins Declarative Pipeline for Automated DevSecOps CI/CD
+// This pipeline orchestrates the build, scan, and deploy phases for a Java application
+// It explicitly integrates SonarQube, Trivy, and a Python Boto3 cleanup script.
+
+pipeline {
+    agent any
+
+    environment {
+        // AWS Region for ECR/EKS
+        AWS_REGION = 'ap-south-1'
+        // Name of the ECR repository
+        ECR_REPO = 'devsecops-app-repo'
+        // Docker image tag (using build number)
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
+        // Python environment for Boto3
+        PYTHON_VENV = "venv"
+    }
+
+    stages {
+
+        // Stage 1: Checkout and Build
+        stage('Build and Package') {
+            steps {
+                echo 'Building and packaging application...'
+                sh 'mvn clean package -DskipTests'
+            }
+        }
+
+        // Stage 2: Static Code Analysis (SonarQube)
+        stage('Security Scan (SonarQube)') {
+            steps {
+                echo 'Running static code analysis...'
+                withSonarQubeEnv('SonarQube-Server') {
+                    sh 'sonar-scanner'
+                }
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // Stage 3: Containerization
+        stage('Docker Build') {
+            steps {
+                echo 'Building Docker image...'
+                sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
+            }
+        }
+
+        // Stage 4: Vulnerability Scanning (Trivy)
+        stage('Vulnerability Scan (Trivy)') {
+            steps {
+                echo 'Scanning Docker image for vulnerabilities with Trivy...'
+                sh "trivy --exit-code 1 --severity CRITICAL ${ECR_REPO}:${IMAGE_TAG}"
+            }
+        }
+
+        // Stage 5: ECR Push
+        stage('Push to ECR') {
+            steps {
+                echo 'Logging into ECR and pushing image...'
+                withAWS(region: AWS_REGION, credentials: 'aws-ecr-creds') {
+                    sh """
+                    aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin 012345678901.dkr.ecr.ap-south-1.amazonaws.com
+                    docker tag ${ECR_REPO}:${IMAGE_TAG} 012345678901.dkr.ecr.ap-south-1.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}
+                    docker push 012345678901.dkr.ecr.ap-south-1.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        // Stage 6: Deployment (EKS/Argo CD)
+        stage('Deploy to EKS') {
+            steps {
+                echo 'Simulating GitOps push for Argo CD to pick up the new deployment...'
+                // sh "git commit -m 'Deploy version ${IMAGE_TAG}' && git push"
+            }
+        }
+
+        // Stage 7: Python/Boto3 Resource Cleanup
+        stage('Cloud Resource Audit (Boto3)') {
+            steps {
+                echo 'Executing Python/Boto3 script for orphaned resource audit...'
+
+                // Initialize Python environment and install Boto3
+                sh "python3 -m venv ${PYTHON_VENV}"
+                sh "source ${PYTHON_VENV}/bin/activate"
+                sh "pip install boto3"
+
+                // Execute the Python cleanup script
+                // Assumes 'cleanup_script.py' is in the workspace
+                // This step ensures resource hygiene and cost optimization post-deployment
+                withAWS(region: AWS_REGION, credentials: 'aws-ecr-creds') {
+                    sh "python3 cleanup_script.py"
+                }
+
+                // Deactivate venv
+                sh "deactivate"
+            }
+        }
+    }
+
+    post {
+        always {
+            // Cleanup and notifications
+            sh 'docker rmi -f $(docker images -aq)'
+            // Clean up the temporary python venv
+            sh "rm -rf ${PYTHON_VENV}"
+            echo "Pipeline finished. Build status: ${currentBuild.result}"
+        }
+    }
+}
